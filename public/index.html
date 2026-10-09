@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Werewolves</title>
+<style>
+:root{--bg:#12101a;--card:#1d1a29;--line:#2e2a40;--fg:#ece8f5;--mut:#9a94b0;--acc:#8b5cf6;--red:#ef4444}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.4 system-ui,sans-serif}
+#app{max-width:640px;margin:0 auto;padding:12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;margin:12px 0}
+h1,h2,h3{margin:0 0 8px}
+p{margin:6px 0}
+button{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:10px 14px;font:inherit;cursor:pointer}
+button:disabled{opacity:.4;cursor:default}
+button.alt{background:#2e2a40}
+button.link{background:none;color:var(--mut);padding:4px 8px}
+input{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:10px;font:inherit;width:100%}
+.row{display:flex;gap:8px;align-items:center}
+.between{justify-content:space-between}
+.muted{color:var(--mut)}
+.center{text-align:center}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:8px}
+.pl{background:#26223a;border:1px solid var(--line);border-radius:10px;padding:8px;text-align:left;color:var(--fg);font-size:15px}
+button.pl{width:100%}
+.pl.dead{opacity:.45}
+.pl.sel{outline:2px solid var(--acc)}
+.role{border-left:4px solid var(--acc)}
+.role.werewolf{border-left-color:var(--red)}
+.scroll{max-height:180px;overflow-y:auto;font-size:14px}
+.msg b{color:var(--acc)}
+#toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:var(--red);padding:10px 16px;border-radius:8px;display:none;z-index:10}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="toast"></div>
+<script src="/socket.io/socket.io.js"></script>
+<script>
+const socket = io();
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+let pid = localStorage.getItem('ww_pid');
+if (!pid) {
+  pid = (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2) + Date.now().toString(36));
+  localStorage.setItem('ww_pid', pid);
+}
+let name = localStorage.getItem('ww_name') || '';
+let S = null, sel = null, lobbies = [];
+
+const ROLES = {
+  werewolf: { n: 'Werewolf', e: '🐺', d: 'Each night your pack picks a villager to eat. By day, lie and blend in.' },
+  villager: { n: 'Villager', e: '🧑‍🌾', d: 'No powers, just your wits and your vote. Find the wolves.' },
+  seer:     { n: 'Seer',     e: '🔮', d: 'Each night, inspect one player to learn if they are a werewolf.' },
+  doctor:   { n: 'Doctor',   e: '💊', d: 'Each night, protect one player from the wolves (you may protect yourself).' },
+  hunter:   { n: 'Hunter',   e: '🏹', d: 'If you die, you take one player down with you.' }
+};
+
+const nameOf = id => { const p = S.players.find(x => x.id === id); return p ? p.name : '?'; };
+const phaseLabel = () => ({ lobby: 'Lobby', night: '🌙 Night ' + S.round, day: '☀️ Day ' + S.round, hunter: "🏹 Hunter's shot", over: 'Game over' }[S.phase]);
+
+function toast(m) {
+  const t = $('#toast'); t.textContent = m; t.style.display = 'block';
+  clearTimeout(t._h); t._h = setTimeout(() => t.style.display = 'none', 3000);
+}
+
+/* ---------- screens ---------- */
+function loginHTML() {
+  return `<div class="card center"><h1>🐺 Werewolves</h1><p class="muted">Enter your name to begin</p>
+  <input id="nameIn" maxlength="16" placeholder="Your name" data-enter="setname">
+  <div style="margin-top:10px"><button data-act="setname">Continue</button></div></div>`;
+}
+
+function homeHTML() {
+  const list = lobbies.length
+    ? lobbies.map(l => `<div class="row between" style="margin:6px 0"><span>${esc(l.host || '?')}'s game · ${l.count} player${l.count === 1 ? '' : 's'} · <b>${esc(l.code)}</b></span><button data-act="joinroom" data-id="${esc(l.code)}">Join</button></div>`).join('')
+    : '<p class="muted">No open games right now. Host one!</p>';
+  return `<div class="card"><h2>Hi, ${esc(name)} 👋</h2>
+    <button data-act="host">Host a new game</button>
+    <div class="row" style="margin-top:12px"><input id="codeIn" maxlength="4" placeholder="Game code" data-enter="joincode"><button data-act="joincode">Join</button></div></div>
+  <div class="card"><h3>Open games</h3>${list}</div>
+  <button class="link" data-act="changename">Change name</button>`;
+}
+
+function lobbyHTML() {
+  const n = S.players.length;
+  const rc = Object.entries(S.roleCounts || {}).map(([r, c]) => `${c}× ${ROLES[r].n}`).join(', ');
+  return `<div class="card"><h3>Waiting for players (${n}/16)</h3>
+    <p>Share code <b style="font-size:1.4em;letter-spacing:3px">${esc(S.code)}</b></p>
+    <p class="muted">Roles with ${n} players: ${esc(rc)}</p>
+    ${S.isHost ? `<button data-act="start" ${n < 4 ? 'disabled' : ''}>Start game${n < 4 ? ' (need 4+)' : ''}</button>` : '<p class="muted">Waiting for the host to start…</p>'}</div>`;
+}
+
+function actionHTML() {
+  const me = S.me, a = S.action;
+  if (S.phase === 'over') {
+    const host = S.players.find(p => p.host);
+    const canRestart = S.isHost || (host && !host.online);
+    return `<div class="card center"><h2>${S.winner === 'villagers' ? '🏘️ The villagers win!' : '🐺 The werewolves win!'}</h2>
+      ${canRestart ? '<button data-act="restart">Play again</button>' : '<p class="muted">Waiting for the host to restart…</p>'}</div>`;
+  }
+  if (!a) {
+    const msg = S.phase === 'hunter' ? '🏹 The Hunter is taking a last shot…'
+      : !me.alive ? '💀 You are dead. Watch quietly and no hints to the living!'
+      : S.phase === 'night' ? '😴 You sleep. Wait for dawn…' : 'Waiting…';
+    return `<div class="card"><p>${msg}</p></div>`;
+  }
+  const titles = { kill: "🐺 Choose tonight's victim", inspect: '🔮 Who do you want to inspect?', protect: '💊 Who do you protect tonight?', vote: '🗳️ Vote to execute someone', shoot: '🏹 Take your final shot' };
+  const targets = S.players.filter(p => p.alive && (a === 'protect' || p.id !== me.id) && !(a === 'kill' && p.role === 'werewolf'));
+  let h = `<div class="card"><h3>${titles[a]}</h3><div class="grid">`;
+  for (const p of targets) {
+    let on = false, badge = '';
+    if (a === 'vote') {
+      const vs = Object.keys(S.votes).filter(k => S.votes[k] === p.id);
+      on = S.votes[me.id] === p.id;
+      badge = vs.length ? `<br><span class="muted">${vs.length}: ${vs.map(nameOf).map(esc).join(', ')}</span>` : '';
+    } else {
+      on = sel === p.id || (a === 'kill' && !sel && S.wolfVotes && S.wolfVotes[me.id] === p.id);
+      if (a === 'kill') {
+        const vs = Object.keys(S.wolfVotes || {}).filter(k => S.wolfVotes[k] === p.id);
+        badge = vs.length ? `<br><span class="muted">🐺 ${vs.map(nameOf).map(esc).join(', ')}</span>` : '';
+      }
+    }
+    h += `<button class="pl ${on ? 'sel' : ''}" data-act="${a === 'vote' ? 'vote' : 'pick'}" data-id="${esc(p.id)}"><b>${esc(p.name)}</b>${badge}</button>`;
+  }
+  h += '</div>';
+  if (a === 'vote') {
+    const total = S.players.filter(p => p.alive).length;
+    h += `<div style="margin-top:8px"><button class="alt" data-act="vote" data-id="skip">${S.votes[me.id] === 'skip' ? '✓ ' : ''}Skip (no execution)</button></div>
+      <p class="muted">${Object.keys(S.votes).length}/${total} votes in. You can change your vote until everyone has voted.</p>`;
+  } else {
+    h += `<div style="margin-top:8px"><button data-act="confirm" ${sel ? '' : 'disabled'}>Confirm</button></div>`;
+    if (a === 'kill' && S.wolfVotes && S.wolfVotes[me.id]) h += `<p class="muted">Your vote: ${esc(nameOf(S.wolfVotes[me.id]))}. Waiting for the rest of the pack…</p>`;
+  }
+  return h + '</div>';
+}
+
+function playersHTML() {
+  return `<div class="card"><h3>Players</h3><div class="grid">${S.players.map(p =>
+    `<div class="pl ${p.alive ? '' : 'dead'}"><b>${esc(p.name)}</b>${p.host ? ' 👑' : ''}${p.id === S.me.id ? ' (you)' : ''}${p.online ? '' : ' 📴'}<br>
+    <span class="muted">${p.role ? ROLES[p.role].e + ' ' + ROLES[p.role].n : (S.phase === 'lobby' ? 'ready' : 'alive')}</span></div>`).join('')}</div></div>`;
+}
+
+function chatHTML() {
+  const wolfNight = S.me.role === 'werewolf' && S.me.alive && S.phase === 'night';
+  const msgs = (wolfNight ? S.wolfChat : S.chat) || [];
+  const can = wolfNight || S.phase === 'lobby' || S.phase === 'over' || (S.phase === 'day' && S.me.alive);
+  return `<div class="card"><h3>${wolfNight ? '🐺 Wolf den (private)' : '💬 Village chat'}</h3>
+    <div class="scroll">${msgs.map(m => `<div class="msg"><b>${esc(m.name)}:</b> ${esc(m.text)}</div>`).join('') || '<span class="muted">No messages yet</span>'}</div>
+    ${can ? `<div class="row" style="margin-top:8px"><input id="chatInput" maxlength="200" placeholder="Say something…" data-enter="chat"><button data-act="chat" data-wolf="${wolfNight ? 1 : 0}">Send</button></div>` : '<p class="muted">Chat is closed right now.</p>'}</div>`;
+}
+
+function gameHTML() {
+  const me = S.me;
+  let h = `<div class="row between"><span>Room <b>${esc(S.code)}</b> · ${phaseLabel()}</span><button class="link" data-act="leave">Leave</button></div>`;
+  if (me.role) {
+    const r = ROLES[me.role];
+    let extra = '';
+    if (me.role === 'werewolf') {
+      const pack = S.players.filter(p => p.role === 'werewolf' && p.id !== me.id).map(p => esc(p.name));
+      extra = `<p>${pack.length ? 'Your pack: <b>' + pack.join(', ') + '</b>' : 'You are the lone wolf.'}</p>`;
+    }
+    if (me.role === 'seer' && me.seen && me.seen.length) {
+      extra = '<p>Your visions:</p>' + me.seen.map(s => `<div>🔮 ${esc(s.name)}: <b>${s.wolf ? 'WEREWOLF' : 'not a werewolf'}</b></div>`).join('');
+    }
+    h += `<div class="card role ${me.role}"><h2>${r.e} You are the ${r.n}${me.alive ? '' : ' (dead)'}</h2><p class="muted">${r.d}</p>${extra}</div>`;
+  }
+  h += S.phase === 'lobby' ? lobbyHTML() : actionHTML();
+  if (S.phase !== 'lobby') h += `<div class="card"><h3>📜 Story</h3><div class="scroll">${S.log.map(l => `<div>${esc(l)}</div>`).join('')}</div></div>`;
+  h += playersHTML() + chatHTML();
+  return h;
+}
+
+function render() {
+  const app = $('#app');
+  const vals = {};
+  app.querySelectorAll('input').forEach(i => vals[i.id] = i.value);
+  const fid = document.activeElement && document.activeElement.id;
+  app.innerHTML = S ? gameHTML() : (name ? homeHTML() : loginHTML());
+  for (const id in vals) { const el = document.getElementById(id); if (el) el.value = vals[id]; }
+  if (fid) {
+    const el = document.getElementById(fid);
+    if (el && el.tagName === 'INPUT') { el.focus(); const l = el.value.length; el.setSelectionRange(l, l); }
+  }
+  app.querySelectorAll('.scroll').forEach(e => e.scrollTop = e.scrollHeight);
+}
+
+/* ---------- events ---------- */
+document.addEventListener('click', e => {
+  const b = e.target.closest('[data-act]'); if (!b) return;
+  const a = b.dataset.act, id = b.dataset.id;
+  switch (a) {
+    case 'setname': { const v = $('#nameIn').value.trim().slice(0, 16); if (!v) return; name = v; localStorage.setItem('ww_name', name); render(); refreshLobbies(); break; }
+    case 'changename': name = ''; localStorage.removeItem('ww_name'); render(); break;
+    case 'host': socket.emit('create', { name, pid }); break;
+    case 'joincode': { const c = $('#codeIn').value.trim().toUpperCase(); if (c) socket.emit('join', { name, pid, code: c }); break; }
+    case 'joinroom': socket.emit('join', { name, pid, code: id }); break;
+    case 'start': socket.emit('start'); break;
+    case 'pick': sel = id; render(); break;
+    case 'confirm': if (sel) { socket.emit(S.action === 'shoot' ? 'hunterShot' : 'nightAction', sel); sel = null; } break;
+    case 'vote': socket.emit('vote', id); break;
+    case 'chat': { const i = $('#chatInput'); if (i && i.value.trim()) { socket.emit('chat', { text: i.value, wolf: b.dataset.wolf === '1' }); i.value = ''; } break; }
+    case 'restart': socket.emit('restart'); break;
+    case 'leave': socket.emit('leave'); break;
+  }
+});
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && e.target.dataset && e.target.dataset.enter) {
+    const b = document.querySelector(`[data-act="${e.target.dataset.enter}"]`);
+    if (b) b.click();
+  }
+});
+
+socket.on('state', s => {
+  const key = s.phase + s.round;
+  if (!S || S.phaseKey !== key) sel = null;
+  S = s; S.phaseKey = key;
+  localStorage.setItem('ww_room', s.code);
+  render();
+});
+socket.on('left', () => { S = null; sel = null; localStorage.removeItem('ww_room'); render(); refreshLobbies(); });
+socket.on('err', m => { toast(m); if (!S) localStorage.removeItem('ww_room'); });
+socket.on('connect', () => {
+  const c = localStorage.getItem('ww_room');
+  if (name && c) socket.emit('join', { name, pid, code: c });
+  refreshLobbies();
+});
+
+function refreshLobbies() {
+  if (S || !name) return;
+  socket.emit('list', l => { if (JSON.stringify(l) !== JSON.stringify(lobbies)) { lobbies = l; if (!S) render(); } });
+}
+setInterval(refreshLobbies, 3000);
+render();
+</script>
+</body>
+</html>
